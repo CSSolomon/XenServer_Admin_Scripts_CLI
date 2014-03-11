@@ -71,6 +71,12 @@
 # |             4. Added removal of zero-length files to workspace          | #
 # |                 initialisation function. Protects from losing older but | #
 # |                 valid backups to empty newer ones.                      | #
+# | 2014_03_09 :                                                            | #
+# |             1. Corrected functions that remove extraneous (older)       | #
+# |                 backups, the part about templates in particular.        | #
+# |                 Problem was caused by the fact that sorting was done    | #
+# |                 for the list returned not by creation date but by uuid  | #
+# |                 alphanumeric precedence.                                | #
 # |-------------------------------------------------------------------------| #
 # | VERSION # 0.3                                                           | #
 # |                                                                         | #
@@ -1093,11 +1099,23 @@ SCRIPTUSAGEINSTRUCTIONS
             done
             if [ "template" == "${l_backup_type}" ] ; then
                 # Get all backups that are template-of and ignore the n latest.
-                older_template_uuids=( $(                                               \
+                # This is more complex than the xva counterpart because sorting is
+			    #+ based on alphanumeric precedence of uuid, not creation date.
+				all_vm_templates=( $(													\
                     xe template-list --minimal                                          \
                         other-config:XenCenter.CustomFields.template-of="${l_vm_uuid}"  | \
-                            sed -e 's/,/\n/g'                                            | \
-                            head -n -"${l_preserve_n:-99999}"                           ) )
+					sed -e 's/,/\n/g'													));
+                older_template_uuids=($( for template_uuid in ${all_vm_templates[@]} ; do 
+                        creation_date=$(xe template-param-get               \
+                                uuid=${template_uuid}                       \
+                                param-name=other-config                     \
+                                param-key=XenCenter.CustomFields.created-on );
+                        # Templates without creation dates are considered ancient
+                        echo "${creation_date:-19000101} ${template_uuid}"; 
+                    done                            | \
+                    sort							| \
+                    cut -d " " -f 2                 | \
+                    head -n -${preserve_n:-9999}	));
                 for i in ${older_template_uuids[@]} ;do
                     log INFO "removing template with uuid = ${i}";
                     yes yes | xe template-uninstall template-uuid="${i}";

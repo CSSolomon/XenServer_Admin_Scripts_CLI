@@ -131,12 +131,32 @@ function log(){
             done
             if [ "template" == "${l_backup_type}" ] ; then
                 # Get all backups that are template-of and ignore the n latest.
-                older_template_uuids=( $(                                               \
+				all_vm_templates=( $(													\
                     xe template-list --minimal                                          \
                         other-config:XenCenter.CustomFields.template-of="${l_vm_uuid}"  | \
-                            sed -e 's/,/\n/g'                                            | \
-                            head -n -"${l_preserve_n:-99999}"                           ) )
+					sed -e 's/,/\n/g'													));
+                older_template_uuids=($( for template_uuid in ${all_vm_templates[@]} ; do 
+                        creation_date=$(xe template-param-get               \
+                                uuid=${template_uuid}                       \
+                                param-name=other-config                     \
+                                param-key=XenCenter.CustomFields.created-on );
+                        # Templates without creation dates are considered ancient
+                        echo "${creation_date:-19000101} ${template_uuid}"; 
+                    done                            | \
+                    sort							| \
+                    cut -d " " -f 2 # FIXME UNCOMMENT | \
 # FIXME DELETE BELOW LINES
+#                    echo   'yes yes | xe template-uninstall template-uuid="${i}" ';
+			))
+# FIXME DELETE ABOVE LINES
+# FIXME UNCOMMENT   head -n -${preserve_n:-9999}	));
+# FIXME DELETE BELOW LINES
+				for i in ${older_template_uuids[@]}; do
+					echo $i 1>&2;
+			    done
+#		echo "older templs: ${older_template_uuids[@]}"
+#		echo ${older_template_uuids[@]} | sed -e "s/[ \t],\+[ \t]\+/\n/g"
+#
 #                all_template_uuids=( $(                                               \
 #                    xe template-list --minimal                                          \
 #                        other-config:XenCenter.CustomFields.template-of="${l_vm_uuid}"  | \
@@ -146,21 +166,24 @@ function log(){
 #                    echo "${k}"
 #                done
 # FIXME DELETE ABOVE LINES
-                for i in ${older_template_uuids[@]} ;do
-                    log INFO "removing template with uuid = ${i}";
-                    yes yes | xe template-uninstall template-uuid="${i}";
+# FIXME UNCOMMENT BELOW LINES
+#                for i in ${older_template_uuids[@]} ;do
+#                    log INFO "removing template with uuid = ${i}";
+#                    yes yes | xe template-uninstall template-uuid="${i}";
+#                done
+# FIXME UNCOMMENT ABOVE LINES
 # FIXME DELETE BELOW LINES
 #                    echo   'yes yes | xe template-uninstall template-uuid="${i}" ';
+			true
 # FIXME DELETE ABOVE LINES
                     if [ "0" -ne "$?" ];then
                         log WARNING "Failed to remove template with uuid = ${i}";
                     fi
-                done
             elif [ "xva" == "${l_backup_type}" ] ; then
                 older_xva_files=( $(                      \
                     ls -1 "${xva_storage_path}"         | \
                         grep -e "${l_vm_uuid}"          | \
-                        head -n -"${l_preserve_n}" ) );
+                        head -n -"${l_preserve_n}"		));
                 for i in ${older_xva_files[@]}; do
                     log INFO "Removing file ${i}";
                     rm -f "${xva_storage_path}/${i}";
@@ -197,12 +220,12 @@ for vm_uuid in $(get_all_vm_uuids); do
         "backup_type:template"              \
         "preserve_n:${template_backlog}"  ;
 
-    echo xva
-    echo ---
-    retain_latest_n_backups                 \
-        "vm_uuid:${vm_uuid}"              \
-        "backup_type:xva"              \
-        "preserve_n:${xva_backlog}"  ;
+#    echo xva
+#    echo ---
+#    retain_latest_n_backups                 \
+#        "vm_uuid:${vm_uuid}"              \
+#        "backup_type:xva"              \
+#        "preserve_n:${xva_backlog}"  ;
 #    echo -e "=====================================\n"
     
     
