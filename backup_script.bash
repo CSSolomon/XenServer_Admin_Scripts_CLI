@@ -1095,8 +1095,10 @@ SCRIPTUSAGEINSTRUCTIONS
             #+ passed to the function with an expression that, when evaluated
             #+ locally, produces the desired assignments.
             for i in $(for i in $*; do echo "l_${i}" | sed -e "s/:/=/"; done); do
+                log DEBUG "evaluating $i"
                 eval local $i;
             done
+
             if [ "template" == "${l_backup_type}" ] ; then
                 # Get all backups that are template-of and ignore the n latest.
                 # This is more complex than the xva counterpart because sorting is
@@ -1105,6 +1107,8 @@ SCRIPTUSAGEINSTRUCTIONS
                     xe template-list --minimal                                          \
                         other-config:XenCenter.CustomFields.template-of="${l_vm_uuid}"  | \
 					sed -e 's/,/\n/g'													));
+                log DEBUG "All VM templates for ${l_vm_uuid}: ${all_vm_templates[@]}"
+
                 older_template_uuids=($( for template_uuid in ${all_vm_templates[@]} ; do 
                         creation_date=$(xe template-param-get               \
                                 uuid=${template_uuid}                       \
@@ -1115,19 +1119,22 @@ SCRIPTUSAGEINSTRUCTIONS
                     done                            | \
                     sort							| \
                     cut -d " " -f 2                 | \
-                    head -n -${preserve_n:-9999}	));
-                for i in ${older_template_uuids[@]} ;do
-                    log INFO "removing template with uuid = ${i}";
-                    yes yes | xe template-uninstall template-uuid="${i}";
+                    head -n -${l_preserve_n:-9999}	)); #/ older_template_uuids
+                log DEBUG "Older VM templates for ${l_vm_uuid}: ${older_template_uuids[@]}"
+
+                for older_template in ${older_template_uuids[@]} ;do
+                    log INFO "removing template with uuid = ${older_template}";
+                    yes yes | xe template-uninstall template-uuid="${older_template}";
                     if [ "0" -ne "$?" ];then
-                        log WARNING "Failed to remove template with uuid = ${i}";
-                    fi
-                done
+                        log WARNING "Failed to remove template with uuid = ${older_template}";
+                    fi # /if something went wrong
+                done; # /for all older templates
+
             elif [ "xva" == "${l_backup_type}" ] ; then
                 older_xva_files=( $(                      \
                     ls -1 "${xva_storage_path}"         | \
                         grep -e "${l_vm_uuid}"          | \
-                        head -n -"${l_preserve_n}" ) );
+                        head -n -"${l_preserve_n:-9999}" ) );
                 for i in ${older_xva_files[@]}; do
                     log INFO "Removing file ${i}";
                     rm -f "${xva_storage_path}/${i}";
@@ -1138,7 +1145,7 @@ SCRIPTUSAGEINSTRUCTIONS
                 return 1;
             fi
 
-        } # /retain_last_n_backups
+        } # /retain_latest_n_backups
 
 
         function get_should_stop_vm(){ # Checks if the VM can/should be stopped for the duration of the backup.
@@ -1301,6 +1308,7 @@ SCRIPTUSAGEINSTRUCTIONS
         fi # / if VM should be re-started.
 
         # Remove all but the n latest backups
+        log INFO "Preparing to remove extraneous backups"
         retain_latest_n_backups                 \
             "vm_uuid:${l_vm_uuid}"              \
             "backup_type:template"              \
