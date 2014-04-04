@@ -1,0 +1,705 @@
+    start_time=$(date +%Y%m%d%H%M);
+    full_date=$(date +%Y%m%d);
+    today=$(date +%a);
+    today_num=$(date +%d);
+    day_num=$(date +%d);
+    sync_retries="5";
+    monthly_backup_today="0";
+    weekly_backup_today="0";
+    pool_uuid=$(xe pool-list --minimal)
+
+    # Variables that are set / read from a temp file, so that they persist
+    #+ when set by functions. They are used by cleanup_at_exit to sanitize
+    #+ the workspace.
+    globals=(                     \
+        "snapshot_to_destroy:"    \
+        "vm_to_start:"            \
+        "unmount_nfs:1"           \
+        "partial_file_to_remove:"); # /globals
+    # The file used as intermediate storage for the global variables.
+    globals_file=$(mktemp /tmp/globals.XXXXXXX);
+
+
+
+    # User-modifiable variables:
+    # USER_MODIFIABLE_OPTION is used for a script function and denotes a user (caller) modifiable variable.
+    nfs_mount="${NFS_MOUNT:-150.140.139.93:/export}"; # USER_MODIFIABLE_OPTION
+    nfs_mountpoint="${NFS_MOUNTPOINT:-/mnt}"; # USER_MODIFIABLE_OPTION
+    lockfile="${LOCKFILE_PATH:-/var/run/lockfile.xen_backup}"; # USER_MODIFIABLE_OPTION
+    log_filename="${LOG_FILENAME:-${start_time}.${pool_uuid}.xenserver_autobackup.log}"; # USER_MODIFIABLE_OPTION
+    log_save_dir="${LOG_SAVE_DIR:-logs}"; # USER_MODIFIABLE_OPTION
+    log_full_dir_path="${LOG_FULL_DIR_PATH:-${nfs_mountpoint}/${log_save_dir}}"; # USER_MODIFIABLE_OPTION
+    log_full_file_path="${LOG_FULL_PATH:-${log_full_dir_path}/${log_filename}}"; # USER_MODIFIABLE_OPTION
+    xva_backup_dir="${XVA_BACKUP_DIR:-backup}"; # USER_MODIFIABLE_OPTION
+    xva_storage_path="${XVA_STORAGE_PATH:-${nfs_mountpoint}/${xva_backup_dir}}"; # USER_MODIFIABLE_OPTION
+    xva_suffix="${XVA_SUFFIX:-bak}"; # USER_MODIFIABLE_OPTION
+    monthly_on="${MONTHLY_ON:-Sat}"; # USER_MODIFIABLE_OPTION
+    weekly_on="${WEEKLY_ON:-Sat}"; # USER_MODIFIABLE_OPTION
+    template_storage="${TEMPLATE_STORAGE:-local}"; # USER_MODIFIABLE_OPTION
+    snapshot_prefix="${SNAPSHOT_PREFIX:-temp}"; # USER_MODIFIABLE_OPTION
+    snapshot_suffix="${SNAPSHOT_SUFFIX:-snapbak}"; # USER_MODIFIABLE_OPTION
+    backup_only_live="${BACKUP_ONLY_LIVE:-0}"; # USER_MODIFIABLE_OPTION
+    low_space_soft_limit="${LOW_SPACE_SOFT_LIMIT:-$((200 * (1024**3)))}"; # USER_MODIFIABLE_OPTION
+    low_space_hard_limit="${LOW_SPACE_HARD_LIMIT:-$((50 * (1024**3)))}"; # USER_MODIFIABLE_OPTION
+    rescan_limit="${RESCAN_LIMIT:-3}" # USER_MODIFIABLE_OPTION
+    # Default values for backup settings. Conservative approach 
+    default_backup_type="${BACKUP_TYPE:-xva-template}"; # USER_MODIFIABLE_OPTION
+    default_xva_backup_freq="${XVA_BACKUP_FREQ:-weekly}"; # USER_MODIFIABLE_OPTION
+    default_template_backup_freq="${TEMPLATE_BACKUP_FREQ:-weekly}"; # USER_MODIFIABLE_OPTION
+    default_backup_live="${BACKUP_LIVE:-1}"; # USER_MODIFIABLE_OPTION
+    default_xva_backlog="${XVA_BACKLOG:-1}"; # USER_MODIFIABLE_OPTION
+    default_template_backlog="${TEMPLATE_BACKLOG:-1}"; # USER_MODIFIABLE_OPTION
+    default_template_sr="${TEMPLATE_SR:-local}"; # USER_MODIFIABLE_OPTION
+    # Below not user modifiable (yet?) because it is dependant on function
+    #+ 'create_xva_backup' implementation
+    xva_filename_format="\${xva_storage_path}/\${l_vm_uuid}.\${start_time}.xva"; 
+
+    # Activate montly / weekly here, so that it can be edited more easily if needed.
+    if [ "${today}" == "${weekly_on}" ] ; then
+        weekly_backup_today="1";
+    fi #/ if today is the day for weekly backups.
+    if [ "${today}" == "${monthly_on}" -a 7 -ge "${day_num}" ] ; then
+        monthly_backup_today="1";
+    fi #/ if today is the day for monthly backups.
+
+  #
+### -- Functions
+#
+    function usage_instructions(){
+        # Prints a help message explaining how this function works.
+        # Required arguments: None
+        # Optional arguments: None
+        cat <<SCRIPTUSAGEINSTRUCTIONS | sed -e "s/^           //" 1>&2
+            ${0}
+            This bash scrint is meant to be used as a cron task. It can also be called as any bash script from the command line. It requires no arguments, because it has default behavior, but if desired said behavior can be altered by setting and exporting any of these environment variables:
+            NFS_MOUNT           : The nfs share that is to be mounted.
+              default: 150.140.139.93:/export
+            NFS_MOUNTPOINT      : Sets the mountpoint where the nfs share should be attached.
+              default: /mnt
+            LOCKFILE_PATH       : Sets the full path for the lockfile to be used.
+              default: /var/run/lockfile.xen_backup
+            LOG_FILENAME        : The file name used for the log file
+              default: <start_time>.xenserver_autobackup_log
+            LOG_SAVE_DIR        : The (relevant) path for the logs.
+              default: logs
+            LOG_FULL_DIR_PATH   : The full directory path for the log. Setting this overrides LOG_SAVE_DIR
+              default: <nfs_mountpoint>/<log_save_dir>
+            LOG_FULL_FILE_PATH  : The full path for the log. Setting this overrides LOG_SAVE_DIR, LOG_FILENAME and LOG_FULL_DIR_PATH
+              default: <log_full_dir_path>/<log_filename>
+            XVA_BACKUP_DIR      : The directory (relevant path) in which the xva backups will be kept.
+              default: backup
+            XVA_STORAGE_PATH    : The full path of the directory xva files are stored. Setting this overrides XVA_BACKUP_DIR
+              default: <nfs_mountpoint}/<xva_backup_dir>
+            XVA_SUFFIX          : The suffix just before .xva for xva backups. 
+              default: bak
+            MONTHLY_ON          : Day of the month monthly backups should be taken on.  Holds for first occurence of day in month.
+              default: Saturday (Sat)
+            WEEKLY_ON           : Day of the week weekly backups are taken on.
+              default: Saturday (Sat)
+            TEMPLATE_STORAGE    : The sr type to be used.
+                                    local       -> Use local storage
+                                    nfs         -> Use NFS SR
+              default: local
+            SNAPSHOT_PREFIX     : A prefix for the temporary snapshots (i.e. not the templates) taken to facilitate safer copying.
+              default: temp
+            SNAPSHOT_SUFFIX     : The suffix used in snapshot names to indicate that snapshot was taken for backup purposes.
+              default: snapback
+            BACKUP_ONLY_LIVE    : Boolean whether only running VMs should be backed-up.
+              default: 0
+            LOW_SPACE_SOFT_LIMIT: Numeric, the soft limit for the free space on all SRs
+              default: 200 GB
+            LOW_SPACE_HARD_LIMIT: Numeric, the hard limit for the free space on all SRs
+              default: 50 GB
+            RESCAN_LIMIT        : How many VMs should be edited before the SRs are re-scanned.
+              default: 3
+            BACKUP_TYPE         : The backup type for this machine. Allowed values are
+                                    template     -> Only template backup.
+                                    xva          -> Only xva backup
+                                    xva-template -> Both xva and template backups
+                                    never        -> Do not backup (for test VMs)
+              default: xva-template
+            XVA_BACKUP_FREQ     : Indicates frequency for taking of xva backups. Allowed
+                                    values are daily, weekly, monthly and never
+              default: weekly
+            TEMPLATE_BACKUP_FREQ: Indicates frequency for taking of template backups.  Allowed values as for xva backup.
+              default: weekly
+            BACKUP_LIVE         : Indicates wheter the machine should be kept running while a backup is taking place. 
+              default: true
+            XVA_BACKLOG         : How many xva backups should be kept.
+              default: 1
+            TEMPLATE_BACKLOG    : How many template backups should be kept.
+              default: 1
+            TEMPLATE_SR         : Default value for backup parameters. What SR should be preferred.
+                                    local       -> local storage
+                                    nfs         -> nfs storage
+                                    default     -> script default
+              default: default.
+SCRIPTUSAGEINSTRUCTIONS
+    } # function usage_instructions
+
+
+    
+
+
+
+    function rescan_sr(){
+        # Rescans all srs so that their information is updated after creating /
+        #+ deleting VM backups.
+        # Required arguments: None.
+        # Optional arguments: None
+        local l_sr_list=( $( xe sr-list --minimal | \
+            sed -e "s/,/ /g" )); 
+        for i in ${l_sr_list[@]}; do
+            xe sr-scan uuid="${i}"
+        done # /for all all srs
+    } # / function rescan_sr
+
+
+
+
+    function backup_db_metadata(){
+        # Creates a backup of the db metadata, including vm-to-uuid correlations.
+        # Required arguments: None
+        # Optional arguments: None
+        # Get IP of pool master.
+        local l_pool_ips="";
+        local l_current_ip=();
+        local l_pif=$( xe pif-list --minimal | sed -e "s/,/ /g" );
+        for i in ${l_pif[@]}; do
+            l_current_ip=( ${l_current_ip[@]} $( xe pif-param-get uuid=${i} param-name=IP | \
+                sed -e "s/\./_/g") )
+        done # /for all pifs
+        l_pool_ips=$( echo "${l_current_ip[@]}"  | \
+            sed -e "s/ /-/g" )
+
+        if [ -z "${l_pool_ips}" ];then
+            log ERROR "Couldn't get any IPs for the pool."
+            return 1;
+        fi #/ if pool physical IPs all blank.
+        
+        # Create pool-to-vm correspondence file. Store in logs.
+        xe vm-list > "${log_full_dir_path}/${l_pool_ips}.${full_date}.vm_to_uuid.log"
+
+        # Backup db metadata. Store in xva storage path.
+        xe pool-dump-database file-name="${xva_storage_path}/${l_pool_ips}.${full_date}.pool_db_dump.bak"
+        return 0;
+    } # / backup_db_metadata
+
+
+
+    function get_value_in_range(){
+        # Issues a warning depending on where free space lies. 
+        #+ It could be used to pause operation if hard limit is reached.
+        # Required arguments: Positional:
+        #+  soft_limit
+        #+  hard_limit
+        #+  value
+        # Optional arguments: Positional:
+        #+ previous_state Previous worst case scenario.
+        local l_soft_limit=${1};
+        local l_hard_limit=${2};
+        local l_value=${3};
+        local l_previous_worst=${4};
+        local l_nocasematch=$(shopt -p nocasematch);
+        if [ "${l_hard_limit}" -gt "${l_soft_limit}" ]; then
+            log WARNING "Hard limit set higher than soft."
+            eval "${l_nocasematch}";
+            return 1;
+        fi
+
+        if [ "hard" == "${l_previous_worst}" ]; then
+            echo "hard";
+            eval "${l_nocasematch}";
+            return 0;
+        fi # /if prefious was hard.
+
+        if [ "${l_value}" -lt "${l_hard_limit}" ];then
+            echo "hard";
+        # / if hard case.
+        elif [ "${l_value}" -lt "${l_soft_limit}" ];then
+            echo "soft";
+        # /if soft case.
+        else 
+            if [ "soft" == "${l_previous_worst}" ]; then
+                echo "soft";
+            else
+                echo "fine";
+            fi #/if this is fine, previous was soft.
+        fi #/if value within ranges.
+
+        eval "${l_nocasematch}";
+        return 0;
+    } #/get_value_in_range
+
+
+
+    function get_sr_free_space(){
+        # Calculates the free space on the SR
+        # Required arguments: Positional:
+        #+  SR UUID
+        # Optional arguments: None
+        local l_sr_to_probe="${1}";
+        
+        # The mountpoint is expected to be given as absolute path.
+        if { echo "${l_sr_to_probe}" | grep -q -e "/" ; }; then
+            available_space=$(df --sync -k -P "${l_sr_to_probe}"    | \
+                sed -e 's/[ \t]\+/ /g'                              | \
+                cut -d ' ' -f 4                                     | \
+                tail -n -1                                          );
+            echo $((available_space * 1024 ));
+        else
+            total_space=$(xe sr-param-get       \
+                uuid="${l_sr_to_probe}"         \
+                param-name=physical-size        );
+            used_space=$(xe sr-param-get        \
+                uuid="${l_sr_to_probe}"         \
+                param-name=physical-utilisation );
+            echo $((total_space - used_space));
+        fi # /if sr is uuid or mountpoint.
+        return 0;
+    } # /get_sr_free_space
+
+
+    function get_free_space_state(){
+        # Issues a warning depending on where free space lies. 
+        #+ It could be used to pause operation if hard limit is reached.
+        # Required arguments: None
+        # Optional arguments: Positional:
+        #+ SR uuid OR
+        #+ mount point (directory absolute path)
+        # TODO add a way to check based on TYPE of repository.
+        local l_sr_to_probe="${1}";
+        local l_status="0";
+
+        # Only call xe sr-scan if it's not a path.
+        if [ ! -z "${l_sr_to_probe}" ] ;then
+            echo "${l_sr_to_probe}" | \
+                grep -q -e ".*/.*"
+            if [ "0" -ne "$?" ]; then
+                xe sr-scan uuid="${l_sr_to_probe}";
+            fi # /if not path
+            local l_free_space=$(get_sr_free_space "${l_sr_to_probe}");
+            local l_free_space_state=$(get_value_in_range   \
+                "${low_space_soft_limit}"                   \
+                "${low_space_hard_limit}"                   \
+                "${l_free_space}"                     );
+        else
+            local l_sr_list=( $({ xe sr-list type=nfs --minimal; \
+                xe sr-list --minimal type=ext ;} | \
+                sed -e "s/,/ /g") ${nfs_mountpoint} );
+            for l_sr_to_probe in ${l_sr_list[@]}; do
+                # This is necessary because otherwise space released is not recognised.
+                xe sr-scan uuid="${l_sr_to_probe}";
+                l_free_space=$(get_sr_free_space "${l_sr_to_probe}");
+                l_free_space_state=$(get_value_in_range \
+                    "${low_space_soft_limit}"           \
+                    "${low_space_hard_limit}"           \
+                    "${l_free_space}"                   \
+                    ${l_free_space_state}               );
+                if [ "0" -ne "$?" ] ;then
+                    echo "hard";
+                    log ERROR "Something went wrong while calculating free space. Consider worst-case scenario."
+                    return 1;
+                fi
+            done # /for all SRs
+        fi
+        echo "${l_free_space_state}";
+        return 0;
+    } # / get_free_space_state
+
+
+
+    function notify_sysadmin(){
+        # Sends an e-mail to the system administrator when things have gone horribly wrong.
+        #+ Sysadmin should have been checking logs, but that's never guaranteed...
+        # Required arguments: Positional:
+        #+  Message to be sent
+        # Optional arguments: None
+        # FIXME IMPLEMENT
+        # Empty for now
+        return 0;
+    } # / notify_sysadmin
+
+
+
+
+    function get_template_sr(){
+        # Gets the uuid of the sr to be used for template storage.
+        # Required arguments: Positional:
+        #+  type of sr required.
+        #+  vm_uuid the sr is about
+        # Optional arguments: None
+        # FIXME : The only "important" value for the type is nfs
+        #+          everything else is ingored. 
+        local nocasematch_status=$(shopt -p nocasematch);
+        local l_sr_type=${1};
+        local l_vm_uuid=${2};
+        local l_storage_uuid="";
+        local l_status="0";
+
+    # Below selects the most relevant, safe sr to use
+        if [ "nfs" == "${l_sr_type}" ] ;then
+                log INFO "Selecting nfs sr as template default storage";
+                l_storage_uuid=( $(                 \
+                    xe sr-list --minimal type=nfs   | \
+                    sed -e "s/,/\n/g"               )); 
+
+        else
+                log INFO "Selecting local sr as template default storage";
+            # Get hosts that are available to the VM
+            local l_possible_hosts=( $(xe vm-param-get  \
+                param-name=possible-hosts               \
+                uuid="${l_vm_uuid}"                     | \
+                sed -e "s/;/ /g"                        ));
+            # Get the name labels of the available hosts
+            local l_host_name_labels=( $(\
+                for i in ${l_possible_hosts[@]} ; do 
+                    xe host-list uuid="${i}"            | \
+                    grep -e name-label                  | \
+                    cut -d ":" -f 2
+                done                                    ));
+            # Get the sr uuids available to the hosts.
+            local l_storage_uuid=($(                   \
+                for i in ${l_host_name_labels[@]} ; do 
+                    xe sr-list --minimal                \
+                        name-label="Local storage"      \
+                        host="${i}"                     | \
+                    sed -e "s/,/ /g"
+                done                                    ));
+        fi # /if nfs - local
+            
+        # If l_sr_uuids is empty, something went wrong. Report and exit.
+        if [ "0" -eq "${#l_storage_uuid[@]}" ] ;then
+            log ERROR "Could not find any ${l_sr_type} SRs that are relevant to this VM"
+            return 1;
+        fi
+
+        # Now get the first sr from this list that hasn't reached
+        #+ a hard limit.
+        local l_sr_state="";
+        for i in ${l_storage_uuid[@]};do
+            l_sr_state=$(get_free_space_state ${i});
+            if [ "hard" == "${l_sr_state}" ]; then
+                log WARNING "SR ${i} has reached hard limit for capacity"
+                notify_sysadmin "WARNING" "Hard limit reached for SR with uuid ${i}"
+                continue;
+            elif [ "soft" == "${l_sr_state}" ]; then
+                log WARNING "SR ${i} has reached soft limit for capacity"
+            else
+                echo ${i};
+                return 0;
+            fi
+        done
+        return 1;
+    } #/ get_template_sr
+
+
+
+    function set_global(){
+        # Set the values of global variables.
+        #+ Uses an intermediate file to allow functions to modify and share values,
+        #+ something bash does not regularly allow.
+        # Required arguments: Mappings:
+        #+  key:value pair for global variable.
+        # Optional arguments: None
+        local l_key_value_pair="${1}";
+        local l_current_key_value_pair="";
+        local l_key="";
+        local l_value="";
+        local l_default_value="";
+        l_key=$(echo ${l_key_value_pair} | cut -d ":" -f 1);
+        l_value=$(echo ${l_key_value_pair} | cut --complement -d ":" -f 1);
+
+        echo "${l_key_value_pair}" | grep -q -e ":"
+        if [ "0" -ne "$?" -o -z "${l_key}" ] ; then
+            log ERROR "set_global not in format <key>:<value>. Instead: ${1}"
+            return 1;
+        fi # /if format not key:value. 
+        
+        l_default_value=$(for i in ${globals[@]}; do
+                echo ${i};
+            done | grep -e "^${l_key}:.*"
+        ); # Find if variable is in the default values and get default value.
+        if [ -z "${l_default_value}" ] ;then
+            log ERROR "Attempting to set non-existing global ${l_key}";
+            return 1;
+        fi
+
+        if [ ! -r "${globals_file}" ]; then
+            log ERROR "Globals file does not exist or not readable.";
+            return 1;
+        fi # /if global file not present / not readable.
+
+        l_current_key_value_pair=$(
+            grep -e "^${l_key}:.*" "${globals_file}"
+        ); #/ get current value in the file.
+
+        if [ -z "${l_current_key_value_pair}" ]; then # if value not yet in file - add.
+            # sed does not insert in empty files, therefore this workaround is required.
+            if [ "0" -eq "$(cat ${globals_file} | wc --bytes)" ] ; then
+                echo "${l_key_value_pair}" >> "${globals_file}"
+            else
+                sed -i -e "1i${l_key_value_pair}" "${globals_file}";
+            fi
+        else # else value in file - replace
+            sed -i -e "/^${l_key}:.*/c${l_key_value_pair}"  "${globals_file}";
+        fi
+
+        return 0;
+    } # /function set_global
+
+
+    function get_global(){
+        # Get the values of global variable based on key.
+        #+ Uses an intermediate file to allow functions to modify and share values,
+        #+ something bash does not regularly allow.
+        # Required arguments: Positional:
+        #+  name of global variable.
+        # Optional arguments: None
+        local l_variable_name="${1}";
+        local l_key_value_pair="";
+        local l_key="";
+        local l_value="";
+        local l_default_value="";
+
+        # Check that the variable name is in the list of recognised globals. If
+        #+ so, keep it's default value.
+        l_default_value=$(for i in ${globals[@]}; do
+                echo ${i};
+            done | grep -e "^${l_variable_name}:.*"
+        ); # Find if variable is in the default values and get default value.
+
+        if [ -z "${l_default_value}" ] ;then
+            log ERROR "Requested non-existing global ${l_variable_name}";
+            return 1;
+        fi # /if default value is null.
+
+        # If the value isn't found in the file, call set_global to set it first.
+        l_key_value_pair=$( grep -e "${l_variable_name}:.*" ${globals_file} );
+        if [ -z "${l_key_value_pair}" ] ;then
+            set_global ${l_default_value} &&    \
+                get_global ${l_variable_name};
+            return $?
+        fi
+
+        l_key=$(echo ${l_key_value_pair} | cut -d ":" -f 1);
+        l_value=$(echo ${l_key_value_pair} | cut --complement -d ":" -f 1);
+        echo "${l_value}";
+        return 0;
+    } # /function get_global
+    
+
+
+    function log(){
+        # Saves the Message in the log file and prints it on stderr as well.
+        # Required arguments: Message
+        # Optional arguments: None
+        # TODO  A future optional argument could indicate the level at which
+        #+      each comment should be added. This way loglevels could be
+        #+      implemented.
+        echo -e "[$(date +%Y%m%d' - '%H:%M:%S)]\t${FUNCNAME[1]}\t${1}\t${@:2}" | \
+            tee -a "/tmp/test_log" 1>&2
+    } # /function log
+
+
+
+    function get_all_vm_uuids(){
+        # Returns the uuids of all the vms on the server 
+        # Required arguments: None
+        # Optional arguments: None
+        # TODO a list of optional arguments to indicate vm characteristics
+        # to get the list of.
+        xe vm-list --minimal is-control-domain=false | \
+            sed -e "s/,/ /g";
+        return $?
+    } # function get_all_vm_uuids
+
+
+
+
+
+    function pick_from_list(){
+        # Reads input from stdin and matches it against the list of its args.
+        #+ returns only when successfully matched.
+        # Required arguments: list of valid inputs. 
+        #   For numbers the arguments allowed are:
+        #       <integer>       (any int)
+        #       <posinteger>    (int > 0)
+        #       <posorzero>     (int >=0)
+        while true; do # Infinite loop, return when valid input
+            unset REPLY;
+            if [ "<posinteger>" ==  "${1}" ]; then
+                echo -n "Please give a positive integer ( >0): " 1>&2
+                read;
+                if [ -z "${REPLY}" ]; then
+                    continue;
+                fi # / if reply empty.
+                if [[ "${REPLY}" == [^0-9] ]] ;then
+                    echo "Invalid option. Please only use numeric arguments." 1>&2
+                    continue;
+                fi # / if reply not a number
+                if [ "0" -ge "${REPLY}" ]; then
+                    echo "Invalid input, please try again."  1>&2
+                    continue;
+                fi # / if value within range.
+                echo ${REPLY};
+                return 0;
+            elif [ "<posorzero>" ==  "${1}" ]; then
+                echo -n "Please give a positive integer ( >=0): " 1>&2
+                read;
+                if [ -z "${REPLY}" ]; then
+                    continue;
+                fi # / if reply empty.
+                if [[ "${REPLY}" == [^0-9] ]] ;then
+                    # Reply was empty string or not a number.                     
+                    echo "Invalid option. Please only use numeric arguments." 1>&2
+                    continue;
+                fi # / if reply not a number
+                if [ "0" -gt "${REPLY}" ]; then
+                    echo "Invalid input, please try again."  1>&2
+                    continue;
+                fi # / if value within range.
+                echo ${REPLY}
+                return $?
+            elif [ '<integer>' ==  "${1}" ]; then
+                echo -n "Please give an integer: " 1>&2
+                read;
+                if [ -z "${REPLY}" ]; then
+                    continue;
+                fi # / if reply empty.
+                # TODO does not handle negatives. (Not necessary so far)
+                if [[ "${REPLY}" == [^0-9] ]] ;then
+                    # Reply was empty string or not a number.                     
+                    echo "Invalid option. Please only use numeric arguments." 1>&2
+                    continue;
+                fi # / if reply not a number
+                echo ${REPLY}
+                return $?
+            else
+                count=1;
+                for i in ${@}; do
+                    echo "$((count++)). ${i}" 1>&2;
+                done ; # /for i in all args.
+                echo -n "Please select the *list number* of one of the " 1>&2
+                echo -n "above options: " 1>&2
+                read;
+                if [ -z "${REPLY}" ]; then
+                    echo "";
+                    continue;
+                fi # / if reply empty.
+                if [[ "${REPLY}" == [^0-9] ]] ;then
+                    # Reply was empty string or not a number.                     
+                    echo "Invalid option. Please only use numeric arguments." 1>&2
+                    continue;
+                elif [ "0" -lt "${REPLY}" -a "${REPLY}" -le "$#" ]; then
+                    # FIXME this part is "dangerous". What it does is replace the
+                    #+ value of Reply with an actual number and pass that to eval 
+                    #+ to echo the corresponding cmdline argument.
+                    eval echo \${$REPLY};
+                    return 0;
+                else
+                    echo "Value out-of-range. Please try again." 1>&2
+                    continue;
+                fi # /if selection numeric and within range.
+            fi  # /if numbers or list
+        done
+    } ; # / function pick_from_list
+
+
+
+    function set_vm_backup_parameters(){
+        # sets the vm_backup_parameters, automatically after user choice
+        #+ or timeout, or by reading user choice.
+        # Required arguments: Positional:
+        #+  uuid of vm
+        # Optional arguments: None
+
+        local vm_uuid="${1}";
+        log INFO "VM ${vm_uuid} has not been setup for backup"
+        local interactive="n";
+        local l_backup_type="";
+        local l_xva_backup_freq="";
+        local l_template_backup_freq="";
+        local l_backup_live="";
+        local l_xva_backlog="";
+        local l_template_backlog="";
+        local l_template_sr="";
+
+        # set bash nocasematch to true, after preserving current state.
+        #+ revert to current state before returning.
+        local nocasematch_status=$(shopt -p nocasematch)
+            shopt -s nocasematch
+
+
+            echo -n "Would you like to manually setup VM for backup? [y/N]: " 1>&2
+            read -t 20 interactive;
+            if [ "y" == "${interactive}" -o "yes" == "${interactive}" ]; then
+                log INFO "Setting VM backup settings for ${vm_uuid} interactively" 
+                echo "Backup type" 1>&2;
+                l_backup_type="$(pick_from_list template xva xva-template never)";
+                echo "XVA backup frequency" 1>&2;
+                l_xva_backup_freq="$(pick_from_list daily weekly monthly never)";
+                echo "Template backup frequency" 1>&2;
+                l_template_backup_freq="$(pick_from_list daily weekly monthly never)";
+                echo "Backup live" 1>&2;
+                l_backup_live="$(pick_from_list true false)";
+                echo "XVA backlog" 1>&2;
+                l_xva_backlog="$(pick_from_list \<posorzero\>)";
+                echo "Template backlog" 1>&2;
+                l_template_backlog="$(pick_from_list \<posorzero\>)";
+                echo "Template SR" 1>&2;
+                l_template_sr="$(pick_from_list local nfs default)";
+                local l_status="1";
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_type=${l_backup_type}                    && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backup_freq=${l_xva_backup_freq}            && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backup_freq=${l_template_backup_freq}  && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_live=${l_backup_live}                    && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backlog=${l_xva_backlog}                    && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backlog=${l_template_backlog}          && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_sr=${l_template_sr}                    && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.has_backup_params=1                             && \
+                l_status="0";
+                eval "${nocasematch_status}";
+                return "${l_status}";
+            else
+                if [ -z "${interactive}"       -o \
+                     "no" == "${interactive}"  -o \
+                     "n" == "${interactive}" ]; then
+
+                     # If no input, add a blank line.
+                     [ -z "${interactive}" ] && echo "";
+                     log INFO "Automatically setting VM backup parameters for ${vm_uuid} to defaults"
+                else
+                     log WARNING "Invalid input given: ${interactive}. Using defaults"
+                fi # / if valid input - else report error
+
+                # Use default settings.
+                log INFO "Using default backup settings for VM ${vm_uuid}:";
+                log DEBUG "default_backup_type:${default_backup_type}"
+                log DEBUG "default_xva_backup_freq:${default_xva_backup_freq}"
+                log DEBUG "default_template_backup_freq:${default_template_backup_freq}"
+                log DEBUG "default_backup_live:${default_backup_live}"
+                log DEBUG "default_xva_backlog:${default_xva_backlog}"
+                log DEBUG "default_template_backlog:${default_template_backlog}"
+                log DEBUG "default_template_sr:${default_template_sr}"
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_type=${default_backup_type}                      && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backup_freq=${default_xva_backup_freq}              && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backup_freq=${default_template_backup_freq}    && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_live=${default_backup_live}                      && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backlog=${default_xva_backlog}                      && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backlog=${default_template_backlog}            && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_sr=${default_template_sr}                      && \
+#                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.has_backup_params=1                                     && \
+                l_status=0;
+                eval "${nocasematch_status}";
+                return "${l_status}";
+            fi # / if interactive - else non-interactive
+            # Control should NEVER reach this part. If it does, log and return error.
+            log ERROR "Unexpected problem in set_vm_backup_parameters.";
+            eval "${nocasematch_status}";
+            return "${l_status}";
+        } # /function set_vm_backup_parameters
+
+
+# RUN THE TESTS
+set_vm_backup_parameters
