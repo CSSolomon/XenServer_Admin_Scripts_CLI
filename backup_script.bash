@@ -1,4 +1,4 @@
-#\${l_vm_uuid}.!/bin/bash
+#!/bin/bash
 # |-------------------------------------------------------------------------| #
 # |                           Program Information                           | #
 # |-------------------------------------------------------------------------| #
@@ -462,8 +462,13 @@ SCRIPTUSAGEINSTRUCTIONS
         local l_sr_to_probe="${1}";
         local l_status="0";
 
+        # Only call xe sr-scan if it's not a path.
         if [ ! -z "${l_sr_to_probe}" ] ;then
-            xe sr-scan uuid="${l_sr_to_probe}";
+            echo "${l_sr_to_probe}" | \
+                grep -q -e ".*/.*"
+            if [ "0" -ne "$?" ]; then
+                xe sr-scan uuid="${l_sr_to_probe}";
+            fi # /if not path
             local l_free_space=$(get_sr_free_space "${l_sr_to_probe}");
             local l_free_space_state=$(get_value_in_range   \
                 "${low_space_soft_limit}"                   \
@@ -683,8 +688,17 @@ SCRIPTUSAGEINSTRUCTIONS
         # TODO  A future optional argument could indicate the level at which
         #+      each comment should be added. This way loglevels could be
         #+      implemented.
+        if [ "DEBUG" == "${1}" ]; then
+            if [ -z "${DEBUG}" ]; then
+                 return 0;
+            fi # /if DEBUG not set
+            if [  "1" -ne "${DEBUG}" ]; then
+                return 0;
+            fi # /if DEBUG not set to 1. 
+        fi # /if debug message without active debug.
         echo -e "[$(date +%Y%m%d' - '%H:%M:%S)]\t${FUNCNAME[1]}\t${1}\t${@:2}" | \
             tee -a "${log_full_file_path}" 1>&2
+        return 0;
     } # /function log
 
 
@@ -860,14 +874,21 @@ SCRIPTUSAGEINSTRUCTIONS
                 fi # / if valid input - else report error
 
                 # Use default settings.
-                log INFO "Using default backup settings for VM ${vm_uuid}";
+                log INFO "Using default backup settings for VM ${vm_uuid}:";
+                log DEBUG "default_backup_type:${default_backup_type}"
+                log DEBUG "default_xva_backup_freq:${default_xva_backup_freq}"
+                log DEBUG "default_template_backup_freq:${default_template_backup_freq}"
+                log DEBUG "default_backup_live:${default_backup_live}"
+                log DEBUG "default_xva_backlog:${default_xva_backlog}"
+                log DEBUG "default_template_backlog:${default_template_backlog}"
+                log DEBUG "default_template_sr:${default_template_sr}"
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_type=${default_backup_type}                      && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backup_freq=${default_xva_backup_freq}              && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backup_freq=${default_template_backup_freq}    && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.backup_live=${default_backup_live}                      && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.xva_backlog=${default_xva_backlog}                      && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backlog=${default_template_backlog}            && \
-                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_backlog=${default_template_sr}                 && \
+                xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.template_sr=${default_template_sr}                      && \
                 xe vm-param-set uuid=${vm_uuid} other-config:XenCenter.CustomFields.has_backup_params=1                                     && \
                 l_status=0;
                 eval "${nocasematch_status}";
@@ -1331,7 +1352,8 @@ SCRIPTUSAGEINSTRUCTIONS
         #+ passed to the function with an expression that, when evaluated
         #+ locally, produces the desired assignments.
         for i in $(for i in $*; do echo "l_${i}" | sed -e "s/:/=/"; done); do
-            eval local $i;
+            log DEBUG "Evaluating ${i}"
+            eval local ${i};
         done
         get_if_should_backup "vm_uuid:${l_vm_uuid}"                   \
                              "backup_type:${l_backup_type}"           \
@@ -1488,6 +1510,20 @@ SCRIPTUSAGEINSTRUCTIONS
             fi
         fi #/if mountpoint already mounted.
 
+        if [ ! -e "${xva_storage_path}" ]; then
+            log WARNING "xva storage path directory ${xva_storage_path} does not exist. Creating."
+            mkdir -p "${xva_storage_path}"; 
+            if [ "0" -ne "$?" ]; then
+                log ERROR "Couldn't create the backup directory. Exiting"
+                return 1;
+            fi # /can't create the directory
+        fi #/ if backup_directory doesn't exist, create it
+
+        if [ ! -w "${xva_storage_path}" ]; then
+            log ERROR "xva storage path not writable. Returning with error";
+            return 1;
+        fi
+
         # Remove any 0-size files left in the mountpoint and log folders
         #+ This is necessary to stop 0-length xva backups from replacing
         #+ older but valid xva files
@@ -1620,6 +1656,7 @@ SCRIPTUSAGEINSTRUCTIONS
 
 # FIXME make the return values useful
         for i in $(get_vm_backup_parameters ${vm_uuid}); do
+            log DEBUG "Evaluating ${i}"
             eval $i;
         done
 
